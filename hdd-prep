@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# =============================================================================
+# hdd-prep — HDD/SSD Formatter & Auto-Mounter (Safe Edition)
+# =============================================================================
+# Version     : 1.4.2
+# Author      : Steve Stepp
+# License     : Apache 2.0
+# =============================================================================
+
+set -euo pipefail
+
+LOGFILE="/var/log/hdd-prep.log"
+
+# ----------------------------- COLORS --------------------------------
+if [[ -t 1 ]]; then
+    BOLD=$(tput bold)
+    RED=$(tput setaf 1)
+    GREEN=$(tput setaf 2)
+    YELLOW=$(tput setaf 3)
+    BLUE=$(tput setaf 4)
+    NC=$(tput sgr0)
+else
+    BOLD="" RED="" GREEN="" YELLOW="" BLUE="" NC=""
+fi
+
+log()  { echo -e "${GREEN}[✓]${NC} $1"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $1" | tee -a "$LOGFILE" >&2; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: $1" | tee -a "$LOGFILE" >&2; }
+error(){ echo -e "${RED}[✗]${NC} $1" >&2; echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" | tee -a "$LOGFILE" >&2; }
+
+# ----------------------------- USAGE ---------------------------------
+usage() {
+    cat <<EOF
+${BLUE}hdd-prep${NC} v1.4.2
+
+${YELLOW}Usage:${NC}
+    sudo $(basename "$0") <DEVICE> <MOUNT_NAME> [OPTIONS]
+    sudo $(basename "$0") --list
+
+${YELLOW}Options:${NC}
+    -h, --help      Show this help
+    -n, --dry-run   Show what would happen (no changes)
+    -f, --force     Skip most confirmations
+    --list          Show current /mnt mounts and fstab status
+
+${RED}WARNING:${NC} This tool permanently erases the target drive.
+EOF
+}
+
+# ----------------------------- LOGGING SETUP -------------------------
+mkdir -p "$(dirname "$LOGFILE")"
+touch "$LOGFILE" 2>/dev/null || true
+chmod 640 "$LOGFILE" 2>/dev/null || true
+
+log_header() {
+    echo "=================================================================" | tee -a "$LOGFILE"
+    echo "hdd-prep started by ${SUDO_USER:-root} on $(date)" | tee -a "$LOGFILE"
+    echo "Command: $0 $*" | tee -a "$LOGFILE"
+    echo "=================================================================" | tee -a "$LOGFILE"
+}
+
+# ----------------------------- PARSE ARGS ----------------------------
+DRY_RUN=false
+FORCE=false
+LIST_MODE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)    usage; exit 0 ;;
+        --list)       LIST_MODE=true ;;
+        -n|--dry-run) DRY_RUN=true ;;
+        -f|--force)   FORCE=true ;;
+        -*)           error "Unknown option $1"; usage; exit 1 ;;
+        *)            break ;;
+    esac
+    shift
+done
+
+if [[ "$LIST_MODE" == true ]]; then
+    echo
+    echo -e "${BLUE}=== Current /mnt Mounts ===${NC}"
+    lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT | grep -E 'NAME|/mnt/' || echo "No mounts under /mnt found."
+
+    echo
+    echo -e "${BLUE}=== Relevant fstab Entries ===${NC}"
+    grep -E '/mnt/' /etc/fstab | column -t || echo "No /mnt entries in fstab."
+
+    echo
+    log "List mode completed."
+    exit 0
+fi
+
+[[ $# -ne 2 ]] && { usage; exit 1; }
+
+DEVICE="$1"
+MOUNT_NAME="$2"
+DEV_PATH="/dev/${DEVICE}"
+PART_PATH="${DEV_PATH}1"
+MOUNT_POINT="/mnt/${MOUNT_NAME}"
+
+log_header "$@"
+
+# ----------------------------- PRE-FLIGHT CHECKS ---------------------
+if [[ $EUID -ne 0 ]]; then
+    error "Must be run as root (use sudo)"
+    exit 1
+fi
+
+if [[ ! -b "$DEV_PATH" ]]; then
+    error "Device ${DEV_PATH} not found"
+    lsblk -d -o NAME,SIZE,MODEL,TRAN
+    exit 1
+fi
+
+if [[ ! $MOUNT_NAME =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    error "Invalid mount name. Use only letters, numbers, ., -, _"
+    exit 1
+fi
+
+# === Device mounted? ===
+if mount | grep -qE "${DEV_PATH}|${PART_PATH}"; then
+    error "Device ${DEV_PATH} (or partition) is currently mounted!"
+    mount | grep -E "${DEVICE}"
+    if [[ "$FORCE" == false ]]; then
+        read -r -p "Force unmount and continue? (yes/NO): " UNMOUNT
+        if [[ "${UNMOUNT,,}" == "yes" ]]; then
+            log "Attempting to unmount ${DEV_PATH}..."
+            umount -l "${DEV_PATH}"* 2>/dev/null || true
+            sleep 1
+            if mount | grep -qE "${DEV_PATH}|${PART_PATH}"; then
+                error "Failed to unmount ${DEV_PATH}. Please unmount manually first."
+                exit 1
+            else
+                log "Successfully unmounted ${DEV_PATH}"
+            fi
+        else
+            error "Aborted by user."
+            exit 1
+        fi
+    fi
+fi
+
+# === Existing fstab conflict? ===
+if grep -qE "${MOUNT_POINT}|${DEVICE}" /etc/fstab; then
+    warn "Existing fstab entry found for ${MOUNT_POINT} or ${DEVICE}"
+    grep -E "${MOUNT_POINT}|${DEVICE}" /etc/fstab | column -t
+    if [[ "$FORCE" == false ]]; then
+        read -r -p "Remove old entries? (yes/NO): " REMOVE
+        if [[ "${REMOVE,,}" == "yes" ]]; then
+            cp /etc/fstab "/etc/fstab.bak.before-hdd-prep.$(date +%F-%H%M%S)"
+            grep -vE "${MOUNT_POINT}|${DEVICE}" /etc/fstab > /tmp/fstab.new
+            mv /tmp/fstab.new /etc/fstab
+            log "Old fstab entries removed"
+        else
+            error "Aborted to prevent boot issues."
+            exit 1
+        fi
+    fi
+fi
+
+# Mount point already in use?
+if [[ -d "$MOUNT_POINT" ]] && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    error "Mount point ${MOUNT_POINT} is already in use by another filesystem!"
+    exit 1
+fi
+
+# ----------------------------- DANGER ZONE ---------------------------
+if [[ "$FORCE" == false && "$DRY_RUN" == false ]]; then
+    echo
+    echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                    DANGER ZONE                             ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo
+    lsblk -d -o NAME,SIZE,MODEL "${DEVICE}" 2>/dev/null || true
+    echo
+    read -r -p "Type 'YES' to permanently erase ${DEV_PATH}: " CONFIRM
+    [[ "$CONFIRM" != "YES" ]] && { error "Aborted."; exit 1; }
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+    warn "DRY-RUN MODE — No changes will be made"
+fi
+
+# ----------------------------- MAIN WORK ----------------------------
+run() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY-RUN] Would run: $*"
+        return 0
+    fi
+    "$@"
+}
+
+log "Starting preparation of ${DEV_PATH} → ${MOUNT_POINT}"
+
+log "1. Wiping old filesystem signatures"
+run wipefs --all --force "$DEV_PATH"
+
+log "2. Creating GPT partition + full ext4 partition"
+run parted -a optimal "$DEV_PATH" --script -- mklabel gpt mkpart primary ext4 1MiB 100%
+
+sleep 2
+run partprobe "$DEV_PATH" 2>/dev/null || true
+
+log "3. Formatting ext4 (optimized for large files)"
+run mkfs.ext4 -m 0 -T largefile4 -L "$MOUNT_NAME" "$PART_PATH"
+
+log "4. Creating mount point"
+run mkdir -p "$MOUNT_POINT"
+
+log "5. Retrieving UUID"
+UUID=$(blkid -s UUID -o value "$PART_PATH")
+[[ -z "$UUID" ]] && { error "Failed to get UUID"; exit 1; }
+
+log "6. Mounting"
+run mount "$PART_PATH" "$MOUNT_POINT"
+
+MOUNT_OPTIONS="defaults,noatime,nodiratime"
+
+log "7. Adding UUID-based entry to /etc/fstab"
+FSTAB_LINE="UUID=${UUID}  ${MOUNT_POINT}  ext4  ${MOUNT_OPTIONS}  0  2"
+
+cp /etc/fstab "/etc/fstab.bak.$(date +%F-%H%M%S)"
+run tee -a /etc/fstab > /dev/null <<< "$FSTAB_LINE"
+
+log "8. Testing mount configuration"
+run systemctl daemon-reload
+run mount -a
+
+echo
+log "${GREEN}SUCCESS!${NC} Drive is ready."
+echo "   Mount point : ${BLUE}${MOUNT_POINT}${NC}"
+echo "   Label       : ${MOUNT_NAME}"
+echo "   UUID        : ${UUID}"
+echo "   Size        : $(df -h "$MOUNT_POINT" | awk 'NR==2 {print $2}')"
+echo
+echo "Full log: ${LOGFILE}"
+echo -e "${GREEN}Ready to use → ${BLUE}cd ${MOUNT_POINT}${NC}"
