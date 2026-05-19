@@ -1,3 +1,5 @@
+![hdd-prep](title.png)
+
 # hdd-prep
 
 A safe, user-friendly Bash script to wipe, partition, format, mount, and permanently configure new HDDs/SSDs under `/mnt/`.
